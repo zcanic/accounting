@@ -1,0 +1,78 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  --color-ivory: #FDFBEB;
+  --color-sky-deep: #0EA5E9;
+  --color-stone-shadow: #78716C;
+  --color-gold: #D97706;
+}
+
+body {
+  font-family: 'Times New Roman', Times, serif;
+  background-color: var(--color-ivory);
+  color: #1C1917;
+  overflow-x: hidden;
+}
+
+/* Divine Brutalism Utilities */
+.font-divine {
+  font-family: 'Times New Roman', Times, serif;
+  letter-spacing: 0.05em;
+}
+
+.bg-marble {
+  background-color: #FDFBEB;
+  background-image: url("data:image/svg+xml,%3Csvg viewBox='0 0 200 200' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='noiseFilter'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.65' numOctaves='3' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23noiseFilter)' opacity='0.05'/%3E%3C/svg%3E");
+}
+
+.shadow-divine {
+  box-shadow: 
+    0 4px 6px -1px rgba(0, 0, 0, 0.1),
+    0 2px 4px -1px rgba(0, 0, 0, 0.06),
+    0 20px 25px -5px rgba(0, 0, 0, 0.1),
+    0 8px 10px -6px rgba(0, 0, 0, 0.1);
+}
+
+.text-shadow-sm {
+  text-shadow: 0 1px 2px rgba(0,0,0,0.1);
+}
+
+/* Column Fluting Effect */
+.column-flute {
+  background: linear-gradient(
+    90deg,
+    #E7E5E4 0%,
+    #F5F5F4 10%,
+    #E7E5E4 20%,
+    #F5F5F4 30%,
+    #E7E5E4 40%,
+    #F5F5F4 50%,
+    #E7E5E4 60%,
+    #F5F5F4 70%,
+    #E7E5E4 80%,
+    #F5F5F4 90%,
+    #E7E5E4 100%
+  );
+  box-shadow: inset 0 0 20px rgba(0,0,0,0.1);
+}
+
+@keyframes float {
+  0%, 100% { transform: translateY(0); }
+  50% { transform: translateY(-5px); }
+}
+
+.animate-float {
+  animation: float 6s ease-in-out infinite;
+}
+
+@keyframes shake {
+  0%, 100% { transform: translateX(0); }
+  10%, 30%, 50%, 70%, 90% { transform: translateX(-4px); }
+  20%, 40%, 60%, 80% { transform: translateX(4px); }
+}
+
+.animate-shake {
+  animation: shake 0.4s cubic-bezier(.36,.07,.19,.97) both;
+}
