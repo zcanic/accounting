@@ -12,6 +12,7 @@ function App() {
     isLoading,
     isFetchingMore,
     isAwaitingNext,
+    hasCheckedRemote,
     hasRemoteData,
     error,
     nextQuestion,
@@ -189,20 +190,35 @@ function App() {
 
       {/* Main Content */}
       <div className="relative z-20 min-h-screen flex flex-col items-center justify-center px-4 py-4 md:py-8">
-        {(isRefilling || !hasRemoteData || error) && (
-          <div className="mb-4 flex items-center gap-3 text-stone-700 bg-white/85 border border-stone-200 px-4 py-2 rounded-full shadow-sm">
-            <motion.span
-              className={`w-3 h-3 rounded-full ${isRefilling ? 'bg-amber-500' : hasRemoteData ? 'bg-emerald-500' : 'bg-stone-400'}`}
-              animate={isRefilling ? { opacity: [0.3, 1, 0.3] } : { opacity: 1 }}
-              transition={{ repeat: isRefilling ? Infinity : 0, duration: 1.2 }}
-            />
-            <span className="font-serif text-sm">
-              {isRefilling && '正在加载新题目...'}
-              {!isRefilling && !hasRemoteData && '当前使用本地题库，远端不可用'}
-              {!isRefilling && error && hasRemoteData && '远端加载异常，稍后重试'}
-            </span>
-          </div>
-        )}
+        {(() => {
+          const statusMessage = (() => {
+            if (isRefilling) return '正在加载新题目...';
+            if (!hasCheckedRemote) return '正在检查远端题库...';
+            if (error && hasRemoteData) return '远端加载异常，稍后重试';
+            if (!hasRemoteData) return '当前使用本地题库，远端不可用';
+            return null;
+          })();
+
+          if (!statusMessage) return null;
+
+          const statusColor = (() => {
+            if (isRefilling) return 'bg-amber-500';
+            if (error && hasRemoteData) return 'bg-rose-500';
+            if (!hasCheckedRemote) return 'bg-sky-500';
+            return hasRemoteData ? 'bg-emerald-500' : 'bg-stone-400';
+          })();
+
+          return (
+            <div className="mb-4 flex items-center gap-3 text-stone-700 bg-white/85 border border-stone-200 px-4 py-2 rounded-full shadow-sm">
+              <motion.span
+                className={`w-3 h-3 rounded-full ${statusColor}`}
+                animate={isRefilling ? { opacity: [0.3, 1, 0.3] } : { opacity: 1 }}
+                transition={{ repeat: isRefilling ? Infinity : 0, duration: 1.2 }}
+              />
+              <span className="font-serif text-sm">{statusMessage}</span>
+            </div>
+          );
+        })()}
         <motion.div 
           className="w-full max-w-4xl bg-[#FDFBEB] rounded-lg border border-stone-300 overflow-hidden relative"
           initial={{ opacity: 0, y: 50 }}
