@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback, useRef } from 'react';
+import { useState, useEffect, useCallback, useRef, useMemo } from 'react';
 import initialScenarios from '../data/scenarios.json';
 
 // n8n Production webhook
@@ -8,26 +8,28 @@ const LOW_STOCK_THRESHOLD = 2;        // 低于该数量时触发补货
 const MAX_EMPTY_FETCH_RETRIES = 3;    // 连续拿到空结果后不再打扰用户
 const CACHE_BUSTER = true;            // 避免上游缓存返回重复
 const DEBUG_MODE = true;              // 启用调试日志
+const FETCH_TIMEOUT = 10000;          // 请求超时时间（10秒）
+const THROTTLE_INTERVAL = 3000;       // 统一节流间隔（3秒）
 
-// 改进的 key 生成函数：为每个题目生成唯一标识
-const generateQuestionKey = (q = {}, index = 0, source = 'unknown') => {
+// 改进的 key 生成函数：仅基于内容哈希，确保相同内容生成相同 key
+const generateQuestionKey = (q = {}) => {
   // 优先使用已有的 id
   if (q?.id) return `id-${q.id}`;
   if (q?._id) return `_id-${q._id}`;
 
-  // 如果没有 id，使用内容和来源生成 key
-  const text = (q.text || q.scenario || '').trim();
-  const debit = Array.isArray(q.debit) ? q.debit.join('|') : '';
-  const credit = Array.isArray(q.credit) ? q.credit.join('|') : '';
+  // 如果没有 id，使用内容生成稳定的 key（不包含时间戳）
+  const text = (q.text || q.scenario || '').trim().toLowerCase();
+  const debit = Array.isArray(q.debit) ? q.debit.sort().join('|') : '';
+  const credit = Array.isArray(q.credit) ? q.credit.sort().join('|') : '';
 
-  // 使用哈希生成更稳定的 key
+  // 使用哈希生成稳定的 key
   const contentHash = `${text}|${debit}|${credit}`;
   const simpleHash = contentHash.split('').reduce((acc, char) => {
     return ((acc << 5) - acc) + char.charCodeAt(0);
-  }, 0).toString(36);
+  }, 0);
 
-  // 添加来源和时间戳确保唯一性
-  return `${source}-${simpleHash}-${Date.now()}-${index}`;
+  // 转换为无符号整数再转36进制，确保一致性
+  return `content-${(simpleHash >>> 0).toString(36)}`;
 };
 
 // Extract scenarios from webhook payload (supports both {scenarios} and {output:{scenarios}})
@@ -38,8 +40,17 @@ const extractScenarios = (data) => {
   return [];
 };
 
-// Fetch questions from webhook
-const fetchQuestionsFromN8n = async () => {
+// Fetch questions from webhook with AbortController and timeout support
+const fetchQuestionsFromN8n = async (abortSignal = null) => {
+  // 创建内部 AbortController 用于超时
+  const timeoutController = new AbortController();
+  const timeoutId = setTimeout(() => {
+    timeoutController.abort();
+    if (DEBUG_MODE) {
+      console.log(`[useQuestionQueue] Request timed out after ${FETCH_TIMEOUT}ms`);
+    }
+  }, FETCH_TIMEOUT);
+
   try {
     const url = new URL(N8N_WEBHOOK_URL);
     url.searchParams.set('count', FETCH_BATCH_SIZE);
@@ -49,12 +60,20 @@ const fetchQuestionsFromN8n = async () => {
       console.log(`[useQuestionQueue] Fetching questions from: ${url.toString()}`);
     }
 
+    // 合并外部和超时的 abort signal
+    const combinedSignal = abortSignal
+      ? AbortSignal.any([abortSignal, timeoutController.signal])
+      : timeoutController.signal;
+
     const response = await fetch(url.toString(), {
       method: 'GET',
       headers: {
         'Content-Type': 'application/json',
       },
+      signal: combinedSignal,
     });
+
+    clearTimeout(timeoutId);
 
     if (!response.ok) {
       console.error(`[useQuestionQueue] HTTP error! status: ${response.status}, url: ${url.toString()}`);
@@ -79,6 +98,16 @@ const fetchQuestionsFromN8n = async () => {
 
     return scenarios;
   } catch (error) {
+    clearTimeout(timeoutId);
+
+    // 区分取消和其他错误
+    if (error.name === 'AbortError') {
+      if (DEBUG_MODE) {
+        console.log('[useQuestionQueue] Fetch aborted (timeout or component unmount)');
+      }
+      return [];
+    }
+
     console.error('[useQuestionQueue] Error fetching from n8n:', error);
     // Return empty on error, will use local data
     return [];
@@ -96,19 +125,54 @@ export const useQuestionQueueFixed = () => {
   const [hasRemoteData, setHasRemoteData] = useState(false);    // 已成功获取远端题
   const [hasCheckedRemote, setHasCheckedRemote] = useState(false); // 完成首轮远端探测
 
-  // Refs for state management
+  // Refs for stable state management (避免闭包陈旧值问题)
   const questionsRef = useRef(questions);
   const isFetchingRef = useRef(false);
   const lastFetchTimeRef = useRef(0);
   const fetchAttemptsRef = useRef(0);
+  const emptyFetchCountRef = useRef(0);  // 使用 ref 追踪最新值
+  const abortControllerRef = useRef(null);  // 用于取消请求
+  const isMountedRef = useRef(true);  // 追踪组件是否已挂载
 
+  // 同步 refs
   useEffect(() => {
     questionsRef.current = questions;
   }, [questions]);
 
-  const canFetchMore = !isFetchingMore && emptyFetchCount <= MAX_EMPTY_FETCH_RETRIES;
+  useEffect(() => {
+    emptyFetchCountRef.current = emptyFetchCount;
+  }, [emptyFetchCount]);
 
-  // 改进的合并函数：允许一定程度的重复
+  // 组件卸载时清理
+  useEffect(() => {
+    isMountedRef.current = true;
+    return () => {
+      isMountedRef.current = false;
+      // 取消任何进行中的请求
+      if (abortControllerRef.current) {
+        abortControllerRef.current.abort();
+      }
+    };
+  }, []);
+
+  // 使用 useMemo 缓存 canFetchMore，避免每次渲染创建新引用
+  const canFetchMore = useMemo(() => {
+    return !isFetchingMore && emptyFetchCount <= MAX_EMPTY_FETCH_RETRIES;
+  }, [isFetchingMore, emptyFetchCount]);
+
+  // 统一节流检查函数
+  const shouldThrottle = useCallback(() => {
+    const timeSinceLastFetch = Date.now() - lastFetchTimeRef.current;
+    if (timeSinceLastFetch < THROTTLE_INTERVAL) {
+      if (DEBUG_MODE) {
+        console.log(`[useQuestionQueue] Throttled: ${timeSinceLastFetch}ms since last fetch (need ${THROTTLE_INTERVAL}ms)`);
+      }
+      return true;
+    }
+    return false;
+  }, []);
+
+  // 改进的合并函数：基于内容哈希去重
   const mergeQuestions = useCallback((incoming = [], source = 'remote') => {
     if (!incoming.length) {
       if (DEBUG_MODE) {
@@ -121,14 +185,14 @@ export const useQuestionQueueFixed = () => {
       console.log(`[useQuestionQueue] mergeQuestions: processing ${incoming.length} questions from ${source}`);
     }
 
-    // 为每个题目生成唯一 key
+    // 为每个题目生成稳定的 key（基于内容，不含时间戳）
     const normalized = incoming.map((q, idx) => {
-      const key = generateQuestionKey(q, idx, source);
+      const key = generateQuestionKey(q);
       const normalizedQuestion = {
         ...q,
         id: key,
         source, // 记录题目来源
-        timestamp: Date.now(), // 记录时间戳
+        timestamp: Date.now(), // 记录添加时间
       };
 
       if (DEBUG_MODE) {
@@ -139,36 +203,23 @@ export const useQuestionQueueFixed = () => {
 
     const currentQuestions = questionsRef.current;
 
-    // 改进的去重逻辑：允许一定程度的重复
+    // 严格去重：基于内容哈希，相同内容不重复添加
     const existingIds = new Set(currentQuestions.map(q => q.id));
     const deduped = normalized.filter(q => {
-      // 如果已经有完全相同的 key，跳过
       if (existingIds.has(q.id)) {
         if (DEBUG_MODE) {
           console.log(`[useQuestionQueue] Skipping duplicate: ${q.id}`);
         }
         return false;
       }
-
-      // 检查是否有非常相似的内容（可选，可以注释掉以允许更多重复）
-      const isSimilar = currentQuestions.some(existing => {
-        const existingText = (existing.text || existing.scenario || '').trim().toLowerCase();
-        const newText = (q.text || q.scenario || '').trim().toLowerCase();
-        return existingText === newText;
-      });
-
-      if (isSimilar && DEBUG_MODE) {
-        console.log(`[useQuestionQueue] Similar content found, but adding anyway: ${q.id}`);
-      }
-
-      return true; // 允许添加，即使内容相似
+      return true;
     });
 
     if (DEBUG_MODE) {
       console.log(`[useQuestionQueue] mergeQuestions: ${deduped.length} new questions after deduplication (${normalized.length - deduped.length} filtered out)`);
     }
 
-    if (deduped.length > 0) {
+    if (deduped.length > 0 && isMountedRef.current) {
       setQuestions(prev => {
         const newQuestions = [...prev, ...deduped];
         if (DEBUG_MODE) {
@@ -183,11 +234,14 @@ export const useQuestionQueueFixed = () => {
     return deduped.length;
   }, []);
 
-  // 初始加载
+  // 初始加载（带请求取消支持）
   useEffect(() => {
     if (DEBUG_MODE) {
       console.log('[useQuestionQueue] Initial load starting');
     }
+
+    // 创建 AbortController 用于取消初始请求
+    const initAbortController = new AbortController();
 
     setIsLoading(true);
 
@@ -198,14 +252,18 @@ export const useQuestionQueueFixed = () => {
     }
 
     // 使用改进的合并函数
-    const addedLocal = mergeQuestions(localSeed, 'local');
+    mergeQuestions(localSeed, 'local');
     setCurrentIndex(0);
     setIsLoading(false);
 
     // 后台获取远程题目
     (async () => {
       try {
-        const remoteScenarios = await fetchQuestionsFromN8n();
+        const remoteScenarios = await fetchQuestionsFromN8n(initAbortController.signal);
+
+        // 检查组件是否已卸载
+        if (!isMountedRef.current) return;
+
         if (remoteScenarios.length > 0) {
           const addedRemote = mergeQuestions(remoteScenarios, 'remote');
           if (addedRemote > 0) {
@@ -216,16 +274,26 @@ export const useQuestionQueueFixed = () => {
           setEmptyFetchCount(prev => prev + 1);
         }
       } catch (err) {
+        if (!isMountedRef.current) return;
         console.error('[useQuestionQueue] Init error:', err);
         setError(err);
       } finally {
-        setHasCheckedRemote(true);
+        if (isMountedRef.current) {
+          setHasCheckedRemote(true);
+        }
       }
     })();
+
+    // 清理函数：取消请求
+    return () => {
+      initAbortController.abort();
+    };
   }, [mergeQuestions]);
 
   // 本地补货
   const replenishFromLocal = useCallback(() => {
+    if (!isMountedRef.current) return 0;
+
     if (DEBUG_MODE) {
       console.log('[useQuestionQueue] Replenishing from local');
     }
@@ -237,155 +305,176 @@ export const useQuestionQueueFixed = () => {
     return added;
   }, [mergeQuestions]);
 
-  // 获取更多题目 - 改进版本
+  // 获取更多题目 - 完全重构版本
   const fetchMoreQuestions = useCallback(async () => {
-    if (!canFetchMore || isFetchingRef.current) {
-      if (DEBUG_MODE) {
-        console.log('[useQuestionQueue] fetchMoreQuestions: skipping - canFetchMore:', canFetchMore, 'isFetchingRef.current:', isFetchingRef.current);
-      }
-      setPendingAdvance(false);
+    // 1. 统一节流检查（在所有调用路径都生效）
+    if (shouldThrottle()) {
       return;
     }
+
+    // 2. 使用 ref 获取最新值进行检查（避免闭包陈旧值）
+    const currentEmptyCount = emptyFetchCountRef.current;
+    const canFetch = !isFetchingRef.current && currentEmptyCount <= MAX_EMPTY_FETCH_RETRIES;
+
+    if (!canFetch) {
+      if (DEBUG_MODE) {
+        console.log('[useQuestionQueue] fetchMoreQuestions: skipping - isFetching:', isFetchingRef.current, 'emptyCount:', currentEmptyCount);
+      }
+      if (isMountedRef.current) {
+        setPendingAdvance(false);
+      }
+      return;
+    }
+
+    // 3. 立即锁定，防止并发请求
+    isFetchingRef.current = true;
+    lastFetchTimeRef.current = Date.now();
 
     fetchAttemptsRef.current += 1;
     const attemptNumber = fetchAttemptsRef.current;
 
+    // 创建 AbortController 用于本次请求
+    abortControllerRef.current = new AbortController();
+
     if (DEBUG_MODE) {
       console.log(`[useQuestionQueue] fetchMoreQuestions #${attemptNumber}: starting`, {
-        canFetchMore,
-        isFetchingMore,
-        emptyFetchCount,
-        pendingAdvance,
+        emptyFetchCount: currentEmptyCount,
         currentQuestions: questionsRef.current.length,
-        currentIndex
       });
     }
 
-    isFetchingRef.current = true;
-    setIsFetchingMore(true);
-    lastFetchTimeRef.current = Date.now();
+    if (isMountedRef.current) {
+      setIsFetchingMore(true);
+    }
 
     try {
-      const scenarios = await fetchQuestionsFromN8n();
+      const scenarios = await fetchQuestionsFromN8n(abortControllerRef.current.signal);
+
+      // 检查组件是否已卸载
+      if (!isMountedRef.current) return;
 
       if (scenarios && scenarios.length > 0) {
         const added = mergeQuestions(scenarios, `remote-attempt-${attemptNumber}`);
         setHasRemoteData(true);
 
         if (added > 0) {
-          // 成功获取新题目
+          // 成功获取新题目，重置计数
           setEmptyFetchCount(0);
-          if (pendingAdvance) {
-            if (DEBUG_MODE) {
-              console.log(`[useQuestionQueue] fetchMoreQuestions #${attemptNumber}: advancing index after adding ${added} questions`);
+
+          // 如果有等待前进的状态，现在可以前进了
+          setPendingAdvance(prev => {
+            if (prev) {
+              if (DEBUG_MODE) {
+                console.log(`[useQuestionQueue] fetchMoreQuestions #${attemptNumber}: advancing index after adding ${added} questions`);
+              }
+              setCurrentIndex(idx => idx + 1);
             }
-            setCurrentIndex(prev => prev + 1);
-            setPendingAdvance(false);
-          }
+            return false;
+          });
         } else {
-          // 没有新增题目（可能都是重复的）
-          if (DEBUG_MODE) {
-            console.log(`[useQuestionQueue] fetchMoreQuestions #${attemptNumber}: no new questions added (all duplicates or similar)`);
-          }
-
-          // 增加空获取计数
-          const newEmptyCount = emptyFetchCount + 1;
-          setEmptyFetchCount(newEmptyCount);
-          setPendingAdvance(false);
-
-          // 如果连续多次获取不到新题目，尝试本地补货
-          if (newEmptyCount >= MAX_EMPTY_FETCH_RETRIES) {
+          // 没有新增题目（全部重复）- 使用函数式更新
+          setEmptyFetchCount(prev => {
+            const newCount = prev + 1;
             if (DEBUG_MODE) {
-              console.log(`[useQuestionQueue] fetchMoreQuestions #${attemptNumber}: emptyFetchCount reached limit (${newEmptyCount}), trying local replenish`);
+              console.log(`[useQuestionQueue] fetchMoreQuestions #${attemptNumber}: no new questions, emptyCount: ${newCount}`);
             }
-            replenishFromLocal();
-          }
+            // 达到上限时触发本地补货
+            if (newCount >= MAX_EMPTY_FETCH_RETRIES) {
+              setTimeout(() => replenishFromLocal(), 0);
+            }
+            return newCount;
+          });
+          setPendingAdvance(false);
         }
       } else {
-        // 远程返回空数组
+        // 远程返回空数组 - 使用函数式更新
         if (DEBUG_MODE) {
           console.log(`[useQuestionQueue] fetchMoreQuestions #${attemptNumber}: received empty scenarios array`);
         }
 
-        const newEmptyCount = emptyFetchCount + 1;
-        setEmptyFetchCount(newEmptyCount);
+        setEmptyFetchCount(prev => prev + 1);
         setPendingAdvance(false);
 
-        // 立即尝试本地补货（远程不可用）
-        if (DEBUG_MODE) {
-          console.log(`[useQuestionQueue] fetchMoreQuestions #${attemptNumber}: remote empty, trying local replenish`);
-        }
+        // 立即尝试本地补货
         replenishFromLocal();
       }
     } catch (err) {
+      if (!isMountedRef.current) return;
+
       if (DEBUG_MODE) {
         console.error(`[useQuestionQueue] fetchMoreQuestions #${attemptNumber}: error:`, err);
       }
       setError('Failed to fetch more questions');
-      console.error('Error fetching questions:', err);
       setPendingAdvance(false);
 
       // 错误时立即尝试本地补货
-      if (DEBUG_MODE) {
-        console.log(`[useQuestionQueue] fetchMoreQuestions #${attemptNumber}: error occurred, trying local replenish`);
-      }
       replenishFromLocal();
     } finally {
-      setIsFetchingMore(false);
       isFetchingRef.current = false;
-      setHasCheckedRemote(true);
+      abortControllerRef.current = null;
+
+      if (isMountedRef.current) {
+        setIsFetchingMore(false);
+        setHasCheckedRemote(true);
+      }
 
       if (DEBUG_MODE) {
         console.log(`[useQuestionQueue] fetchMoreQuestions #${attemptNumber}: completed`);
       }
     }
-  }, [canFetchMore, mergeQuestions, emptyFetchCount, pendingAdvance, replenishFromLocal]);
+  }, [shouldThrottle, mergeQuestions, replenishFromLocal]);
 
-  // 自动获取更多题目
+  // 自动获取更多题目 - 精简依赖项，避免无限循环
   useEffect(() => {
-    const remaining = questions.length - currentIndex - 1;
+    // 使用 ref 获取最新状态，避免将这些值加入依赖项
+    const questionsLen = questionsRef.current.length;
+    const remaining = questionsLen - currentIndex - 1;
 
     if (DEBUG_MODE) {
-      console.log(`[useQuestionQueue] Auto-fetch check: remaining=${remaining}, isLoading=${isLoading}, isFetchingMore=${isFetchingMore}, pendingAdvance=${pendingAdvance}`);
+      console.log(`[useQuestionQueue] Auto-fetch check: remaining=${remaining}, isLoading=${isLoading}`);
     }
 
-    if (isLoading || isFetchingMore) return;
-    if (!canFetchMore) return;
-    if (pendingAdvance) return;
-    if (questions.length === 0) return;
+    // 基本检查
+    if (isLoading) return;
+    if (isFetchingRef.current) return;
+    if (questionsLen === 0) return;
+
+    // 使用 ref 检查是否超出重试限制
+    if (emptyFetchCountRef.current > MAX_EMPTY_FETCH_RETRIES) {
+      if (DEBUG_MODE) {
+        console.log('[useQuestionQueue] Auto-fetch: exceeded retry limit');
+      }
+      return;
+    }
 
     if (remaining <= LOW_STOCK_THRESHOLD) {
-      // 防止过于频繁的自动获取
-      const timeSinceLastFetch = Date.now() - lastFetchTimeRef.current;
-      if (timeSinceLastFetch < 2000) { // 2秒内不重复触发
-        if (DEBUG_MODE) {
-          console.log(`[useQuestionQueue] Auto-fetch throttled: ${timeSinceLastFetch}ms since last fetch`);
-        }
-        return;
-      }
-
       if (DEBUG_MODE) {
         console.log(`[useQuestionQueue] Triggering auto-fetch: remaining=${remaining} <= ${LOW_STOCK_THRESHOLD}`);
       }
+      // fetchMoreQuestions 内部会处理节流
       fetchMoreQuestions();
     }
-  }, [currentIndex, questions.length, isLoading, isFetchingMore, canFetchMore, pendingAdvance, fetchMoreQuestions]);
+  }, [currentIndex, isLoading, fetchMoreQuestions]);  // 仅保留必要依赖
 
   const currentQuestion = questions[currentIndex] || null;
 
-  // 改进的 nextQuestion 函数
+  // 改进的 nextQuestion 函数 - 使用 ref 获取最新状态
   const nextQuestion = useCallback(() => {
+    const questionsLen = questionsRef.current.length;
+    const currentEmptyCount = emptyFetchCountRef.current;
+    const canFetch = !isFetchingRef.current && currentEmptyCount <= MAX_EMPTY_FETCH_RETRIES;
+
     if (DEBUG_MODE) {
-      console.log(`[useQuestionQueue] nextQuestion called: currentIndex=${currentIndex}, total=${questions.length}`);
+      console.log(`[useQuestionQueue] nextQuestion called: currentIndex=${currentIndex}, total=${questionsLen}`);
     }
 
     // 如果已到末尾
-    if (currentIndex >= questions.length - 1) {
+    if (currentIndex >= questionsLen - 1) {
       if (DEBUG_MODE) {
         console.log('[useQuestionQueue] nextQuestion: at end of questions');
       }
 
-      if (canFetchMore && !isFetchingMore) {
+      if (canFetch) {
         // 可以获取更多题目
         if (DEBUG_MODE) {
           console.log('[useQuestionQueue] nextQuestion: setting pendingAdvance and fetching more');
@@ -410,7 +499,7 @@ export const useQuestionQueueFixed = () => {
     // 正常前进到下一题
     setCurrentIndex(prev => prev + 1);
     return true;
-  }, [currentIndex, questions.length, fetchMoreQuestions, canFetchMore, replenishFromLocal, isFetchingMore]);
+  }, [currentIndex, fetchMoreQuestions, replenishFromLocal]);
 
   const resetQueue = useCallback(() => {
     setCurrentIndex(0);
@@ -462,3 +551,6 @@ export const useQuestionQueueFixed = () => {
 };
 
 export default useQuestionQueueFixed;
+
+// 别名导出，保持向后兼容
+export { useQuestionQueueFixed as useQuestionQueue };
