@@ -1,0 +1,12 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(npm run build)",
+      "Bash(git add:*)",
+      "Bash(git commit -m \"$\\(cat <<''EOF''\n修复webhook请求重复和无法及时更新的问题\n\n核心修复:\n- 重构generateQuestionKey：移除时间戳，仅基于内容哈希生成稳定key\n- 添加AbortController和10秒请求超时机制\n- 统一节流逻辑：shouldThrottle\\(\\)函数，3秒间隔\n- 精简useEffect依赖项：从7个减少到3个，避免无限循环\n- 使用ref追踪最新状态：emptyFetchCountRef避免闭包陈旧值\n- 函数式状态更新：setEmptyFetchCount\\(prev => prev + 1\\)\n- 组件卸载保护：isMountedRef防止卸载后更新状态\n\n🤖 Generated with [Claude Code]\\(https://claude.com/claude-code\\)\n\nCo-Authored-By: Claude Opus 4.5 <noreply@anthropic.com>\nEOF\n\\)\")",
+      "Bash(git push)",
+      "Bash(npm update -g @anthropic-ai/claude-code)",
+      "Bash(claude:*)"
+    ]
+  }
+}

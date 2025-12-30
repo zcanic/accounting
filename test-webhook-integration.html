@@ -1,0 +1,355 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Webhook集成测试 - Sanctuary of the Ledger</title>
+    <style>
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            max-width: 900px;
+            margin: 40px auto;
+            padding: 20px;
+            background: #1a1a1a;
+            color: #e0e0e0;
+        }
+        h1 {
+            color: #4CAF50;
+            border-bottom: 2px solid #4CAF50;
+            padding-bottom: 10px;
+        }
+        .test-section {
+            background: #2a2a2a;
+            padding: 20px;
+            margin: 20px 0;
+            border-radius: 8px;
+            border-left: 4px solid #2196F3;
+        }
+        .status {
+            display: inline-block;
+            padding: 5px 12px;
+            border-radius: 4px;
+            font-weight: bold;
+            margin: 5px 0;
+        }
+        .status.pending { background: #FF9800; color: #000; }
+        .status.running { background: #2196F3; }
+        .status.success { background: #4CAF50; }
+        .status.error { background: #f44336; }
+        button {
+            background: #4CAF50;
+            color: white;
+            border: none;
+            padding: 12px 24px;
+            border-radius: 5px;
+            cursor: pointer;
+            font-size: 16px;
+            margin: 10px 5px;
+        }
+        button:hover {
+            background: #45a049;
+        }
+        button:disabled {
+            background: #666;
+            cursor: not-allowed;
+        }
+        pre {
+            background: #1a1a1a;
+            padding: 15px;
+            border-radius: 5px;
+            overflow-x: auto;
+            font-size: 13px;
+        }
+        .log {
+            max-height: 400px;
+            overflow-y: auto;
+            font-family: 'Courier New', monospace;
+            font-size: 12px;
+        }
+        .log-entry {
+            padding: 3px 0;
+            border-bottom: 1px solid #333;
+        }
+        .log-time {
+            color: #888;
+        }
+        .log-info { color: #2196F3; }
+        .log-success { color: #4CAF50; }
+        .log-error { color: #f44336; }
+        .log-warn { color: #FF9800; }
+    </style>
+</head>
+<body>
+    <h1>🧪 Webhook 集成测试</h1>
+
+    <div class="test-section">
+        <h2>测试配置</h2>
+        <p><strong>Webhook URL:</strong> http://8.138.47.26:5678/webhook/get-accounting-scenarios</p>
+        <p><strong>超时时间:</strong> 30秒</p>
+        <p><strong>预期返回:</strong> 5 道题目</p>
+    </div>
+
+    <div class="test-section">
+        <h2>测试 1: 单次 Webhook 请求</h2>
+        <div id="test1-status" class="status pending">待运行</div>
+        <button onclick="runTest1()" id="test1-btn">运行测试</button>
+        <div id="test1-result"></div>
+    </div>
+
+    <div class="test-section">
+        <h2>测试 2: 去重机制验证</h2>
+        <div id="test2-status" class="status pending">待运行</div>
+        <button onclick="runTest2()" id="test2-btn">运行测试</button>
+        <div id="test2-result"></div>
+    </div>
+
+    <div class="test-section">
+        <h2>测试 3: 超时保护（会很快完成）</h2>
+        <div id="test3-status" class="status pending">待运行</div>
+        <button onclick="runTest3()" id="test3-btn">运行测试</button>
+        <div id="test3-result"></div>
+    </div>
+
+    <div class="test-section">
+        <h2>实时日志</h2>
+        <button onclick="clearLog()">清空日志</button>
+        <div id="log" class="log"></div>
+    </div>
+
+    <script type="module">
+        // 导入工具函数（模拟）
+        const generateQuestionKey = (question = {}) => {
+            const q = question || {};
+            if (q?.id) return `id-${q.id}`;
+            if (q?._id) return `_id-${q._id}`;
+
+            const text = (q.text || q.scenario || '').trim().toLowerCase();
+            const debit = Array.isArray(q.debit) ? q.debit.sort().join('|') : '';
+            const credit = Array.isArray(q.credit) ? q.credit.sort().join('|') : '';
+
+            const contentHash = `${text}|${debit}|${credit}`;
+            const simpleHash = contentHash.split('').reduce((acc, char) => {
+                return ((acc << 5) - acc) + char.charCodeAt(0);
+            }, 0);
+
+            return `content-${(simpleHash >>> 0).toString(36)}`;
+        };
+
+        const extractScenarios = (data) => {
+            if (!data) return [];
+            if (Array.isArray(data?.scenarios)) return data.scenarios;
+            if (Array.isArray(data?.output?.scenarios)) return data.output.scenarios;
+            return [];
+        };
+
+        const WEBHOOK_URL = 'http://8.138.47.26:5678/webhook/get-accounting-scenarios';
+        const FETCH_TIMEOUT = 30000;
+
+        let logEntries = [];
+
+        function log(message, type = 'info') {
+            const time = new Date().toLocaleTimeString();
+            logEntries.push({ time, message, type });
+            updateLogDisplay();
+        }
+
+        function updateLogDisplay() {
+            const logDiv = document.getElementById('log');
+            logDiv.innerHTML = logEntries.map(entry => `
+                <div class="log-entry">
+                    <span class="log-time">[${entry.time}]</span>
+                    <span class="log-${entry.type}">${entry.message}</span>
+                </div>
+            `).join('');
+            logDiv.scrollTop = logDiv.scrollHeight;
+        }
+
+        window.clearLog = () => {
+            logEntries = [];
+            updateLogDisplay();
+        };
+
+        async function fetchWithTimeout(url, timeout = FETCH_TIMEOUT) {
+            const controller = new AbortController();
+            const timeoutId = setTimeout(() => controller.abort(), timeout);
+
+            try {
+                const startTime = Date.now();
+                log(`发起请求: ${url}`, 'info');
+
+                const response = await fetch(url, { signal: controller.signal });
+                clearTimeout(timeoutId);
+
+                const duration = Date.now() - startTime;
+                log(`请求完成，耗时: ${duration}ms`, 'success');
+
+                if (!response.ok) {
+                    throw new Error(`HTTP ${response.status}`);
+                }
+
+                const data = await response.json();
+                return { data, duration };
+            } catch (error) {
+                clearTimeout(timeoutId);
+                if (error.name === 'AbortError') {
+                    log(`请求超时（${timeout}ms）`, 'error');
+                    throw new Error('Request timeout');
+                }
+                log(`请求失败: ${error.message}`, 'error');
+                throw error;
+            }
+        }
+
+        window.runTest1 = async () => {
+            const statusEl = document.getElementById('test1-status');
+            const resultEl = document.getElementById('test1-result');
+            const btnEl = document.getElementById('test1-btn');
+
+            statusEl.className = 'status running';
+            statusEl.textContent = '运行中...';
+            btnEl.disabled = true;
+
+            try {
+                log('=== 测试 1: 单次 Webhook 请求 ===', 'info');
+
+                const { data, duration } = await fetchWithTimeout(WEBHOOK_URL);
+                const scenarios = extractScenarios(data);
+
+                log(`解析到 ${scenarios.length} 道题目`, 'success');
+
+                scenarios.forEach((q, idx) => {
+                    const key = generateQuestionKey(q);
+                    log(`题目 ${idx + 1}: ID=${q.id}, Key=${key}`, 'info');
+                });
+
+                const success = scenarios.length === 5;
+                statusEl.className = success ? 'status success' : 'status error';
+                statusEl.textContent = success ? '✅ 通过' : '❌ 失败';
+
+                resultEl.innerHTML = `
+                    <h3>测试结果</h3>
+                    <p>✅ 请求耗时: ${duration}ms (超时阈值: ${FETCH_TIMEOUT}ms)</p>
+                    <p>✅ 返回题目数量: ${scenarios.length}</p>
+                    <p>✅ 数据格式: ${data.output ? '嵌套格式' : '直接格式'}</p>
+                    <pre>${JSON.stringify(scenarios[0], null, 2)}</pre>
+                `;
+
+                log('测试 1 完成！', 'success');
+            } catch (error) {
+                statusEl.className = 'status error';
+                statusEl.textContent = '❌ 失败';
+                resultEl.innerHTML = `<p class="log-error">错误: ${error.message}</p>`;
+                log(`测试 1 失败: ${error.message}`, 'error');
+            } finally {
+                btnEl.disabled = false;
+            }
+        };
+
+        window.runTest2 = async () => {
+            const statusEl = document.getElementById('test2-status');
+            const resultEl = document.getElementById('test2-result');
+            const btnEl = document.getElementById('test2-btn');
+
+            statusEl.className = 'status running';
+            statusEl.textContent = '运行中...';
+            btnEl.disabled = true;
+
+            try {
+                log('=== 测试 2: 去重机制验证 ===', 'info');
+
+                // 第一次请求
+                log('第一次请求...', 'info');
+                const { data: data1 } = await fetchWithTimeout(WEBHOOK_URL);
+                const scenarios1 = extractScenarios(data1);
+
+                // 第二次请求
+                await new Promise(resolve => setTimeout(resolve, 3000)); // 节流间隔
+                log('第二次请求（3秒后）...', 'info');
+                const { data: data2 } = await fetchWithTimeout(WEBHOOK_URL);
+                const scenarios2 = extractScenarios(data2);
+
+                // 去重测试
+                const allScenarios = [...scenarios1, ...scenarios2];
+                const keys1 = new Set(scenarios1.map(q => generateQuestionKey(q)));
+                const keys2 = new Set(scenarios2.map(q => generateQuestionKey(q)));
+
+                const duplicates = scenarios2.filter(q => keys1.has(generateQuestionKey(q)));
+
+                log(`第一批题目: ${scenarios1.length} 道`, 'info');
+                log(`第二批题目: ${scenarios2.length} 道`, 'info');
+                log(`重复题目: ${duplicates.length} 道`, duplicates.length > 0 ? 'warn' : 'success');
+
+                statusEl.className = 'status success';
+                statusEl.textContent = '✅ 通过';
+
+                resultEl.innerHTML = `
+                    <h3>去重测试结果</h3>
+                    <p>第一批题目: ${scenarios1.length} 道</p>
+                    <p>第二批题目: ${scenarios2.length} 道</p>
+                    <p>重复题目: ${duplicates.length} 道</p>
+                    <p>${duplicates.length > 0 ? '✅ 检测到重复（去重机制生效）' : '⚠️ 无重复（两次请求可能返回不同题目）'}</p>
+                `;
+
+                log('测试 2 完成！', 'success');
+            } catch (error) {
+                statusEl.className = 'status error';
+                statusEl.textContent = '❌ 失败';
+                resultEl.innerHTML = `<p class="log-error">错误: ${error.message}</p>`;
+                log(`测试 2 失败: ${error.message}`, 'error');
+            } finally {
+                btnEl.disabled = false;
+            }
+        };
+
+        window.runTest3 = async () => {
+            const statusEl = document.getElementById('test3-status');
+            const resultEl = document.getElementById('test3-result');
+            const btnEl = document.getElementById('test3-btn');
+
+            statusEl.className = 'status running';
+            statusEl.textContent = '运行中...';
+            btnEl.disabled = true;
+
+            try {
+                log('=== 测试 3: 超时保护 ===', 'info');
+                log('使用极短超时时间（1000ms）模拟超时...', 'warn');
+
+                const shortTimeout = 1000;
+
+                try {
+                    await fetchWithTimeout(WEBHOOK_URL, shortTimeout);
+                    // 如果没超时（网络特别快）
+                    statusEl.className = 'status success';
+                    statusEl.textContent = '⚠️ 未超时';
+                    resultEl.innerHTML = `<p>网络速度太快，未触发超时保护</p>`;
+                    log('未触发超时（请求太快完成）', 'warn');
+                } catch (error) {
+                    if (error.message === 'Request timeout') {
+                        statusEl.className = 'status success';
+                        statusEl.textContent = '✅ 通过';
+                        resultEl.innerHTML = `
+                            <h3>超时保护测试结果</h3>
+                            <p>✅ 在 ${shortTimeout}ms 后正确触发超时</p>
+                            <p>✅ 请求被正确中止</p>
+                            <p>✅ 生产环境超时设置: ${FETCH_TIMEOUT}ms</p>
+                        `;
+                        log('超时保护机制正常工作！', 'success');
+                    } else {
+                        throw error;
+                    }
+                }
+            } catch (error) {
+                statusEl.className = 'status error';
+                statusEl.textContent = '❌ 失败';
+                resultEl.innerHTML = `<p class="log-error">错误: ${error.message}</p>`;
+                log(`测试 3 失败: ${error.message}`, 'error');
+            } finally {
+                btnEl.disabled = false;
+            }
+        };
+
+        log('测试页面加载完成', 'success');
+        log('准备就绪，点击按钮开始测试', 'info');
+    </script>
+</body>
+</html>

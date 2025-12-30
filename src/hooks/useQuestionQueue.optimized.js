@@ -21,12 +21,9 @@ import {
 // ==================== 配置常量 ====================
 
 /** n8n Production webhook URL */
-// 生产环境使用HTTPS代理，开发环境使用HTTP直连
-const N8N_WEBHOOK_URL = import.meta.env.PROD
-  ? 'https://zcanic.xyz/n8n-webhook/get-accounting-scenarios'  // 生产环境HTTPS代理
-  : 'http://8.138.47.26:5678/webhook/get-accounting-scenarios'; // 开发环境HTTP直连
+const N8N_WEBHOOK_URL = 'http://8.138.47.26:5678/webhook/get-accounting-scenarios';
 
-/** 每次请求的题目数量（注：webhook 固定返回 5 题，此常量仅用于本地批次管理） */
+/** 每次请求的题目数量 */
 const FETCH_BATCH_SIZE = 5;
 
 /** 剩余题目低于此数量时触发自动补货 */
@@ -42,7 +39,7 @@ const CACHE_BUSTER = true;
 const DEBUG_MODE = true;
 
 /** 请求超时时间（毫秒） */
-const FETCH_TIMEOUT = 30000;
+const FETCH_TIMEOUT = 10000;
 
 /** 请求节流间隔（毫秒） */
 const THROTTLE_INTERVAL = 3000;
@@ -78,6 +75,7 @@ const fetchQuestionsFromN8n = async (abortSignal = null) => {
 
   try {
     const url = new URL(N8N_WEBHOOK_URL);
+    url.searchParams.set('count', FETCH_BATCH_SIZE);
     if (CACHE_BUSTER) {
       url.searchParams.set('_', Date.now().toString());
     }
@@ -367,8 +365,8 @@ export const useQuestionQueueFixed = () => {
     const initAbortController = new AbortController();
     setIsLoading(true);
 
-    // 加载全部本地题库作为种子数据
-    const localSeed = initialScenarios.scenarios;
+    // 加载本地种子数据
+    const localSeed = initialScenarios.scenarios.slice(0, FETCH_BATCH_SIZE);
     debugLog(`Loaded ${localSeed.length} local questions`);
 
     mergeQuestions(localSeed, 'local');
